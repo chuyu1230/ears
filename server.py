@@ -160,14 +160,29 @@ def relative_view(feats: dict) -> dict:
 def transcribe(wav_path: str) -> str:
     if not GROQ_KEY:
         raise RuntimeError("GROQ_API_KEY 未配置")
+    # 硅基流动只收 file + model；带上 Groq 那套 language 会直接 400
+    silicon = "siliconflow" in ASR_BASE.lower()
     with open(wav_path, "rb") as f:
+        if silicon:
+            files: dict = {
+                "file": ("a.wav", f, "audio/wav"),
+                "model": (None, ASR_MODEL),
+            }
+            data = None
+        else:
+            files = {"file": ("a.wav", f, "audio/wav")}
+            data = {"model": ASR_MODEL}
+            if ASR_LANG:
+                data["language"] = ASR_LANG
         r = _session.post(
-            f"{ASR_BASE}/audio/transcriptions",
+            f"{ASR_BASE.rstrip('/')}/audio/transcriptions",
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            files={"file": ("a.wav", f, "audio/wav")},
-            data={"model": ASR_MODEL, "language": ASR_LANG},
+            files=files,
+            data=data,
             proxies=_proxies, timeout=60)
-    r.raise_for_status()
+    if not r.ok:
+        detail = (r.text or r.reason)[:400]
+        raise RuntimeError(f"{r.status_code} {detail}")
     return (r.json().get("text") or "").strip()
 
 
