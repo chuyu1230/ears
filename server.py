@@ -180,7 +180,7 @@ def _post_transcription(wav_path: str, model: str, silicon: bool):
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
             files={"file": ("a.wav", f, "audio/wav")},
             data=data,
-            proxies=_proxies, timeout=60)
+            proxies=_proxies, timeout=(10, 120))
 
 
 def transcribe(wav_path: str) -> str:
@@ -247,7 +247,7 @@ def judge(text: str, feats: dict, rel: dict) -> dict:
             "temperature": 0.2,
             "messages": [{"role": "user", "content": prompt}],
         },
-        proxies=_proxies, timeout=90)
+        proxies=_proxies, timeout=(10, 90))
     if not r.ok:
         raise RuntimeError(f"情绪接口 {r.status_code}: {(r.text or r.reason)[:300]}")
     return _parse_emotion_json(_llm_message_text(r.json()))
