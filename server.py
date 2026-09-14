@@ -198,6 +198,34 @@ def transcribe(wav_path: str) -> str:
     return (r.json().get("text") or "").strip()
 
 
+def _llm_message_text(payload: dict) -> str:
+    choice = (payload.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    parts = [
+        msg.get("content"),
+        msg.get("reasoning_content"),
+        choice.get("text"),
+    ]
+    text = "\n".join(str(p).strip() for p in parts if p and str(p).strip())
+    if "</think>" in text:
+        text = text.split("</think>", 1)[-1]
+    return text.strip()
+
+
+def _parse_emotion_json(raw: str) -> dict:
+    if not raw:
+        raise ValueError("模型没返回内容")
+    s, e = raw.find("{"), raw.rfind("}")
+    if s < 0 or e <= s:
+        raise ValueError("模型没给出JSON")
+    out = json.loads(raw[s:e + 1])
+    if out.get("emotion") not in EMOTIONS:
+        out["emotion"] = "平静"
+    out.setdefault("confidence", 0.5)
+    out.setdefault("hint", "")
+    return out
+
+
 def judge(text: str, feats: dict, rel: dict) -> dict:
     rel_line = f"\n和她平时相比: {json.dumps(rel, ensure_ascii=False)}" if rel else "\n(个人基线还在学习中)"
     prompt = (
@@ -207,21 +235,22 @@ def judge(text: str, feats: dict, rel: dict) -> dict:
         f"从这些标签里选1个最贴切的: {'/'.join(EMOTIONS)}\n"
         "规则: 特征只是线索, 以说话内容为主; 不要过度解读; hint用一句话描述她此刻的状态, "
         "只描述状态本身, 不许编造原因或事件。\n"
-        '只输出JSON: {"emotion":"...","confidence":0.0到1.0,"hint":"..."}'
+        "不要思考过程，不要markdown。"
+        '只输出一行JSON: {"emotion":"...","confidence":0.0到1.0,"hint":"..."}'
     )
     r = _session.post(
-        f"{LLM_BASE}/chat/completions",
+        f"{LLM_BASE.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {LLM_KEY}", "Content-Type": "application/json"},
-        json={"model": LLM_MODEL, "max_tokens": 200,
-              "messages": [{"role": "user", "content": prompt}]},
-        proxies=_proxies, timeout=30)
-    r.raise_for_status()
-    raw = r.json()["choices"][0]["message"]["content"].strip()
-    s, e = raw.find("{"), raw.rfind("}")
-    out = json.loads(raw[s:e + 1])
-    if out.get("emotion") not in EMOTIONS:
-        out["emotion"] = "平静"
-    return out
+        json={
+            "model": LLM_MODEL,
+            "max_tokens": 512,
+            "temperature": 0.2,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        proxies=_proxies, timeout=90)
+    if not r.ok:
+        raise RuntimeError(f"情绪接口 {r.status_code}: {(r.text or r.reason)[:300]}")
+    return _parse_emotion_json(_llm_message_text(r.json()))
 
 
 def fire_webhook(entry: dict) -> None:
