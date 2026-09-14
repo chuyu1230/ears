@@ -44,8 +44,15 @@ LLM_KEY = os.environ.get("LLM_API_KEY", "") or GROQ_KEY
 LLM_BASE = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
 ASR_BASE = os.environ.get("ASR_BASE_URL", "https://api.groq.com/openai/v1")
-ASR_MODEL = os.environ.get("ASR_MODEL", "whisper-large-v3")
+ASR_MODEL = os.environ.get("ASR_MODEL", "whisper-large-v3").strip().strip("\"'")
 ASR_LANG = os.environ.get("ASR_LANG", "zh")
+# 硅基流动 /audio/transcriptions 目前认这些；填成 Qwen 对话或 Qwen3-ASR 会 20012
+_SILICON_STT = (
+    "FunAudioLLM/SenseVoiceSmall",
+    "TeleAI/TeleSpeechASR",
+    "XingChenAGI/XingChenASR-V3.2",
+    "XingChenAGI/XingChenASR-V3.2-Ultra",
+)
 # 环境变量用直白名字；SFE_前缀的旧名继续兼容
 def _env(name, default=""):
     return os.environ.get(name, "") or os.environ.get("SFE_" + name, "") or default
@@ -157,32 +164,37 @@ def relative_view(feats: dict) -> dict:
 
 # ── 转写与判断 ──
 
+def _silicon_stt_model(name: str) -> str:
+    if name in _SILICON_STT:
+        return name
+    return "FunAudioLLM/SenseVoiceSmall"
+
+
+def _post_transcription(wav_path: str, model: str, silicon: bool):
+    with open(wav_path, "rb") as f:
+        data = {"model": model}
+        if (not silicon) and ASR_LANG:
+            data["language"] = ASR_LANG
+        return _session.post(
+            f"{ASR_BASE.rstrip('/')}/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
+            files={"file": ("a.wav", f, "audio/wav")},
+            data=data,
+            proxies=_proxies, timeout=60)
+
+
 def transcribe(wav_path: str) -> str:
     if not GROQ_KEY:
         raise RuntimeError("GROQ_API_KEY 未配置")
-    # 硅基流动只收 file + model；带上 Groq 那套 language 会直接 400
     silicon = "siliconflow" in ASR_BASE.lower()
-    with open(wav_path, "rb") as f:
-        if silicon:
-            files: dict = {
-                "file": ("a.wav", f, "audio/wav"),
-                "model": (None, ASR_MODEL),
-            }
-            data = None
-        else:
-            files = {"file": ("a.wav", f, "audio/wav")}
-            data = {"model": ASR_MODEL}
-            if ASR_LANG:
-                data["language"] = ASR_LANG
-        r = _session.post(
-            f"{ASR_BASE.rstrip('/')}/audio/transcriptions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            files=files,
-            data=data,
-            proxies=_proxies, timeout=60)
+    model = _silicon_stt_model(ASR_MODEL) if silicon else ASR_MODEL
+    r = _post_transcription(wav_path, model, silicon)
+    if (not r.ok) and silicon and model != "FunAudioLLM/SenseVoiceSmall":
+        r = _post_transcription(wav_path, "FunAudioLLM/SenseVoiceSmall", True)
+        model = "FunAudioLLM/SenseVoiceSmall"
     if not r.ok:
         detail = (r.text or r.reason)[:400]
-        raise RuntimeError(f"{r.status_code} {detail}")
+        raise RuntimeError(f"{r.status_code} 用的模型={model} {detail}")
     return (r.json().get("text") or "").strip()
 
 
