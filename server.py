@@ -13,6 +13,7 @@
 """
 import json
 import os
+import re
 import statistics
 import subprocess
 import tempfile
@@ -188,14 +189,21 @@ def transcribe(wav_path: str) -> str:
         raise RuntimeError("GROQ_API_KEY 未配置")
     silicon = "siliconflow" in ASR_BASE.lower()
     model = _silicon_stt_model(ASR_MODEL) if silicon else ASR_MODEL
-    r = _post_transcription(wav_path, model, silicon)
-    if (not r.ok) and silicon and model != "FunAudioLLM/SenseVoiceSmall":
-        r = _post_transcription(wav_path, "FunAudioLLM/SenseVoiceSmall", True)
-        model = "FunAudioLLM/SenseVoiceSmall"
-    if not r.ok:
-        detail = (r.text or r.reason)[:400]
-        raise RuntimeError(f"{r.status_code} 用的模型={model} {detail}")
-    return (r.json().get("text") or "").strip()
+    last_err = None
+    for attempt in range(2):
+        try:
+            r = _post_transcription(wav_path, model, silicon)
+            if (not r.ok) and silicon and model != "FunAudioLLM/SenseVoiceSmall":
+                r = _post_transcription(wav_path, "FunAudioLLM/SenseVoiceSmall", True)
+                model = "FunAudioLLM/SenseVoiceSmall"
+            if r.ok:
+                return (r.json().get("text") or "").strip()
+            last_err = f"{r.status_code} 用的模型={model} {(r.text or r.reason)[:400]}"
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_err = str(exc)
+        if attempt == 0:
+            time.sleep(1)
+    raise RuntimeError(last_err or "转写失败")
 
 
 def _llm_message_text(payload: dict) -> str:
@@ -213,17 +221,28 @@ def _llm_message_text(payload: dict) -> str:
 
 
 def _parse_emotion_json(raw: str) -> dict:
-    if not raw:
-        raise ValueError("模型没返回内容")
-    s, e = raw.find("{"), raw.rfind("}")
-    if s < 0 or e <= s:
-        raise ValueError("模型没给出JSON")
-    out = json.loads(raw[s:e + 1])
-    if out.get("emotion") not in EMOTIONS:
-        out["emotion"] = "平静"
-    out.setdefault("confidence", 0.5)
-    out.setdefault("hint", "")
-    return out
+    raw = (raw or "").replace("“", '"').replace("”", '"').replace("，", ",")
+    emotion = ""
+    for label in sorted(EMOTIONS, key=len, reverse=True):
+        if label and label in raw:
+            emotion = label
+            break
+    hint = ""
+    hm = re.search(r'"hint"\s*:\s*"((?:\\.|[^"\\])*)"', raw)
+    if hm:
+        hint = hm.group(1)
+    if not emotion:
+        s = raw.find("{")
+        if s >= 0:
+            try:
+                out, _ = json.JSONDecoder().raw_decode(raw[s:])
+                emotion = str(out.get("emotion") or "")
+                hint = hint or str(out.get("hint") or "")
+            except json.JSONDecodeError:
+                pass
+    if emotion not in EMOTIONS:
+        emotion = "平静"
+    return {"emotion": emotion, "confidence": 0.5, "hint": (hint or "")[:80]}
 
 
 def judge(text: str, feats: dict, rel: dict) -> dict:
@@ -327,7 +346,7 @@ async def listen(file: UploadFile = File(...)):
     except Exception as exc:
         import traceback
         traceback.print_exc()
-        emo = {"emotion": "平静", "confidence": 0.0, "hint": f"情绪判断失败: {exc}"}
+        emo = {"emotion": "平静", "confidence": 0.0, "hint": "语气稍后再认，这句话先记下"}
     entry = {
         "ts": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
         "text": text, "emotion": emo.get("emotion", "平静"),
